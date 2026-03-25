@@ -1,0 +1,15 @@
+target/
+.env
+*.log
+Cargo.lock
+cache/
+recordings/
+.agents
+polymarket-orderbook-substreams
+Polymarket-P-L-Substreams
+resources/*.csv
+resources/*.spkg
+online
+logs
+proto
+recordings
