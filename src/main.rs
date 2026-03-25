@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::signal;
 use tokio_postgres::config::Host;
+use tokio_postgres::{config::SslMode, NoTls};
 use tracing::{error, info, warn};
 
 const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
@@ -708,26 +709,59 @@ async fn connect_pg(
     if hosts.is_empty() {
         return Err("pg host missing".to_string());
     }
+    let ssl_mode = config.get_ssl_mode();
+
+    if ssl_mode == SslMode::Disable {
+        let (client, conn) = config
+            .connect(NoTls)
+            .await
+            .map_err(|e| format!("pg connect failed (sslmode=disable): {e}; debug={e:?}"))?;
+        let handle = tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                warn!("pg connection error: {e}");
+            }
+        });
+        return Ok((client, handle));
+    }
 
     let mut builder =
         SslConnector::builder(SslMethod::tls()).map_err(|e| format!("ssl builder failed: {e}"))?;
-    if let Ok(ca_file) = env::var("PG_SSL_ROOT_CERT") {
-        let ca_file = ca_file.trim();
-        if !ca_file.is_empty() {
-            builder
-                .set_ca_file(ca_file)
-                .map_err(|e| format!("set ca file failed: {e}"))?;
+    let ca_file = env::var("PG_SSL_ROOT_CERT").ok().map(|v| v.trim().to_string());
+    let verify_from_env = env::var("PG_SSL_VERIFY")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    let should_verify = verify_from_env
+        || ca_file
+            .as_deref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+
+    if should_verify {
+        if let Some(ca_file) = ca_file.as_deref() {
+            if !ca_file.is_empty() {
+                builder
+                    .set_ca_file(ca_file)
+                    .map_err(|e| format!("set ca file failed: {e}"))?;
+            } else {
+                builder
+                    .set_default_verify_paths()
+                    .map_err(|e| format!("set default verify paths failed: {e}"))?;
+            }
         } else {
             builder
                 .set_default_verify_paths()
                 .map_err(|e| format!("set default verify paths failed: {e}"))?;
         }
+        builder.set_verify(SslVerifyMode::PEER);
     } else {
-        builder
-            .set_default_verify_paths()
-            .map_err(|e| format!("set default verify paths failed: {e}"))?;
+        builder.set_verify(SslVerifyMode::NONE);
     }
-    builder.set_verify(SslVerifyMode::PEER);
 
     match &hosts[0] {
         Host::Tcp(_) => {}
@@ -738,7 +772,12 @@ async fn connect_pg(
     let (client, conn) = config
         .connect(connector)
         .await
-        .map_err(|e| format!("pg connect failed: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "pg connect failed: {e}; sslmode={ssl_mode:?}; verify={}; debug={e:?}",
+                if should_verify { "peer" } else { "none" }
+            )
+        })?;
 
     let handle = tokio::spawn(async move {
         if let Err(e) = conn.await {

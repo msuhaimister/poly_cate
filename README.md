@@ -9,7 +9,8 @@
 
 - `MARKET_SYNC_PG_URL` 或 `DATABASE_URL` 或 `PG_URL`：PostgreSQL 连接串（必填）
 - `MARKET_SYNC_TABLE`：目标表名，默认 `polymarket_markets`
-- `PG_SSL_ROOT_CERT`：可选，PostgreSQL TLS CA 文件路径
+- `PG_SSL_VERIFY`：可选，是否校验证书（`true/false`，默认 `false`）
+- `PG_SSL_ROOT_CERT`：可选，PostgreSQL TLS CA 文件路径（设置后会启用证书校验）
 - `RUST_LOG`：日志级别，默认 `info`
 
 ## 本地运行
@@ -43,4 +44,5 @@ cargo run
 可选：
 
 - `MARKET_SYNC_TABLE`
+- `PG_SSL_VERIFY`
 - `PG_SSL_ROOT_CERT`
