@@ -4,6 +4,7 @@
 
 - 启动时执行一次全量市场同步到 PostgreSQL（若历史已做过则自动跳过）
 - 订阅 Polymarket `market` websocket 的 `new_market` 事件，实时增量写入 PostgreSQL
+- 全量同步写库按 1000 条一批事务提交，避免逐条提交带来的开销
 
 ## 环境变量
 

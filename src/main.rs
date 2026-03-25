@@ -16,6 +16,7 @@ use tracing::{error, info, warn};
 const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
 const MARKET_WSS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const DEFAULT_TABLE: &str = "polymarket_markets";
+const FULL_SYNC_UPSERT_BATCH_SIZE: usize = 1000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -482,7 +483,9 @@ async fn full_sync_to_pg(
     let incoming_ids: HashSet<String> = incoming.iter().map(|m| m.id.clone()).collect();
     let delete_ids: Vec<String> = existing_ids.difference(&incoming_ids).cloned().collect();
 
-    let upserts = upsert_markets_to_pg(pg_url, &table, incoming).await?;
+    let upserts =
+        upsert_markets_to_pg_in_batches(pg_url, &table, incoming, FULL_SYNC_UPSERT_BATCH_SIZE)
+            .await?;
     let deleted = delete_markets_from_pg(pg_url, &table, &delete_ids).await?;
     Ok((upserts, deleted, incoming.len()))
 }
@@ -517,37 +520,7 @@ async fn upsert_markets_to_pg(
     let (client, _handle) = connect_pg(pg_url).await?;
     ensure_schema_with_client(&client, &table).await?;
 
-    let upsert_sql = format!(
-        "insert into {table} (
-            id, condition_id, slug, question, tags, neg_risk_market_id, neg_risk,
-            clob_token_ids, outcomes, order_price_min_tick_size, order_min_size, fees_enabled,
-            end_date_iso, end_date, active, closed, synced_at
-        )
-        values (
-            $1, $2, $3, $4, $5, $6, $7,
-            $8, $9, $10, $11, $12,
-            $13, $14, $15, $16, now()
-        )
-        on conflict (id) do update set
-            condition_id = excluded.condition_id,
-            slug = excluded.slug,
-            question = excluded.question,
-            tags = excluded.tags,
-            neg_risk_market_id = excluded.neg_risk_market_id,
-            neg_risk = excluded.neg_risk,
-            clob_token_ids = excluded.clob_token_ids,
-            outcomes = excluded.outcomes,
-            order_price_min_tick_size = excluded.order_price_min_tick_size,
-            order_min_size = excluded.order_min_size,
-            fees_enabled = excluded.fees_enabled,
-            end_date_iso = excluded.end_date_iso,
-            end_date = excluded.end_date,
-            active = excluded.active,
-            closed = excluded.closed,
-            synced_at = now()",
-        table = table
-    );
-
+    let upsert_sql = build_market_upsert_sql(&table);
     for m in markets {
         let tags: Vec<String> = m
             .tags
@@ -581,6 +554,99 @@ async fn upsert_markets_to_pg(
             .map_err(|e| format!("upsert market {} failed: {e}", m.id))?;
     }
     Ok(markets.len())
+}
+
+async fn upsert_markets_to_pg_in_batches(
+    pg_url: &str,
+    table_raw: &str,
+    markets: &[MarketLite],
+    batch_size: usize,
+) -> Result<usize, String> {
+    if markets.is_empty() {
+        return Ok(0);
+    }
+    let batch_size = batch_size.max(1);
+    let table = sanitize_ident(table_raw).ok_or_else(|| format!("invalid table: {table_raw}"))?;
+    let (mut client, _handle) = connect_pg(pg_url).await?;
+    ensure_schema_with_client(&client, &table).await?;
+    let upsert_sql = build_market_upsert_sql(&table);
+
+    let mut total = 0usize;
+    for chunk in markets.chunks(batch_size) {
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| format!("begin tx failed: {e}"))?;
+        for m in chunk {
+            let tags: Vec<String> = m
+                .tags
+                .iter()
+                .map(|t| normalize_tag_for_pg(t))
+                .filter(|t| !t.is_empty())
+                .collect();
+            tx.execute(
+                &upsert_sql,
+                &[
+                    &m.id,
+                    &m.condition_id,
+                    &m.slug,
+                    &m.question,
+                    &tags,
+                    &m.neg_risk_market_id,
+                    &m.neg_risk,
+                    &m.clob_token_ids,
+                    &m.outcomes,
+                    &m.order_price_min_tick_size,
+                    &m.order_min_size,
+                    &m.fees_enabled,
+                    &m.end_date_iso,
+                    &m.end_date,
+                    &m.active,
+                    &m.closed,
+                ],
+            )
+            .await
+            .map_err(|e| format!("upsert market {} failed in batch: {e}", m.id))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| format!("commit tx failed: {e}"))?;
+        total += chunk.len();
+    }
+    Ok(total)
+}
+
+fn build_market_upsert_sql(table: &str) -> String {
+    format!(
+        "insert into {table} (
+            id, condition_id, slug, question, tags, neg_risk_market_id, neg_risk,
+            clob_token_ids, outcomes, order_price_min_tick_size, order_min_size, fees_enabled,
+            end_date_iso, end_date, active, closed, synced_at
+        )
+        values (
+            $1, $2, $3, $4, $5, $6, $7,
+            $8, $9, $10, $11, $12,
+            $13, $14, $15, $16, now()
+        )
+        on conflict (id) do update set
+            condition_id = excluded.condition_id,
+            slug = excluded.slug,
+            question = excluded.question,
+            tags = excluded.tags,
+            neg_risk_market_id = excluded.neg_risk_market_id,
+            neg_risk = excluded.neg_risk,
+            clob_token_ids = excluded.clob_token_ids,
+            outcomes = excluded.outcomes,
+            order_price_min_tick_size = excluded.order_price_min_tick_size,
+            order_min_size = excluded.order_min_size,
+            fees_enabled = excluded.fees_enabled,
+            end_date_iso = excluded.end_date_iso,
+            end_date = excluded.end_date,
+            active = excluded.active,
+            closed = excluded.closed,
+            synced_at = now()",
+        table = table
+    )
 }
 
 async fn delete_markets_from_pg(
